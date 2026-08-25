@@ -2,50 +2,486 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RecordType { Goal, Decision, Change, OpenQuestion, Handoff }
-impl RecordType { fn as_str(self) -> &'static str { match self { Self::Goal => "goal", Self::Decision => "decision", Self::Change => "change", Self::OpenQuestion => "open_question", Self::Handoff => "handoff" } } }
-
-#[derive(Clone, Copy)] pub enum ProposalOutcome { Accept, Reject }
-#[derive(Copy, Clone, Debug, PartialEq, Eq)] pub enum SensitiveReleaseState { NotRequired, Pending, Approved }
-impl SensitiveReleaseState { fn as_str(self) -> &'static str { match self { Self::NotRequired => "not_required", Self::Pending => "pending", Self::Approved => "approved" } } fn from_str(value: String) -> Self { match value.as_str() { "not_required" => Self::NotRequired, "approved" => Self::Approved, _ => Self::Pending } } }
-pub struct Task { pub id: i64 }
-pub struct Record { pub id: i64, pub content: String, pub is_stale: bool, pub is_conflict: bool, pub conflicts_with: Option<i64>, pub sensitive_release_state: SensitiveReleaseState }
-pub struct Snapshot { pub goal: String, pub confirmed: Vec<Record>, pub rejected: Vec<Record> }
-pub struct Heartbeat { pub schema_version: String, pub goal: String, pub recent_changes: Vec<String> }
-pub struct Handoff { pub schema_version: String, pub goal: String, pub decisions: Vec<String>, pub open_questions: Vec<String>, pub next_steps: Vec<String> }
-pub struct BoardView { pub goal: String, pub pending: Vec<Record> }
-
-pub trait Storage { fn connection(&self) -> &Connection; }
-pub struct SqliteStorage { connection: Connection }
-impl Storage for SqliteStorage { fn connection(&self) -> &Connection { &self.connection } }
-
-pub struct Board { storage: SqliteStorage }
-pub struct TaskAccessApi<'a> { engine: &'a Board }
-pub trait TaskTransport { fn request_heartbeat(&self, api: &TaskAccessApi<'_>, task_id: i64, schema_version: &str, actor: &str) -> rusqlite::Result<Heartbeat>; }
-pub struct LoopbackRelay;
-impl LoopbackRelay { pub fn request_heartbeat(&self, api: &TaskAccessApi<'_>, task_id: i64, schema_version: &str, actor: &str) -> rusqlite::Result<Heartbeat> { api.what_just_happened(task_id, schema_version, actor) } }
-impl<'a> TaskAccessApi<'a> { pub fn new(engine: &'a Board) -> Self { Self { engine } } pub fn what_just_happened(&self, task_id: i64, schema_version: &str, actor: &str) -> rusqlite::Result<Heartbeat> { self.engine.what_just_happened(task_id, schema_version, actor) } pub fn compose_handoff(&self, task_id: i64, schema_version: &str, actor: &str) -> rusqlite::Result<Handoff> { self.engine.compose_handoff(task_id, schema_version, actor) } pub fn subscribe(&self, actor: &str) -> rusqlite::Result<()> { self.engine.ensure_session_active(actor) } pub fn revoke_session(&self, actor: &str) -> rusqlite::Result<()> { self.engine.revoke_session(actor) } pub fn propose(&self, task_id: i64, kind: RecordType, content: &str, actor: &str) -> rusqlite::Result<Record> { self.engine.propose_with_current_version(task_id, kind, content, actor) } pub fn propose_from_version(&self, task_id: i64, kind: RecordType, content: &str, actor: &str, base_version: i64) -> rusqlite::Result<Record> { self.engine.propose_from_version_impl(task_id, kind, content, actor, base_version) } pub fn pending(&self, task_id: i64) -> rusqlite::Result<Vec<Record>> { self.engine.pending(task_id) } pub fn accept(&self, id: i64) -> rusqlite::Result<()> { self.engine.review(id, ProposalOutcome::Accept) } pub fn reject(&self, id: i64) -> rusqlite::Result<()> { self.engine.review(id, ProposalOutcome::Reject) } pub fn edit_and_accept(&self, id: i64, content: &str) -> rusqlite::Result<()> { self.engine.edit_and_accept(id, content) } pub fn approve_sensitive_release(&self, id: i64) -> rusqlite::Result<()> { self.engine.approve_sensitive_release(id) } }
-impl TaskTransport for LoopbackRelay { fn request_heartbeat(&self, api: &TaskAccessApi<'_>, task_id: i64, schema_version: &str, actor: &str) -> rusqlite::Result<Heartbeat> { api.what_just_happened(task_id, schema_version, actor) } }
-impl Board {
- pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> { let storage = SqliteStorage { connection: Connection::open(path)? }; let board = Self { storage }; board.migrate()?; Ok(board) }
- fn migrate(&self) -> rusqlite::Result<()> { self.storage.connection().execute_batch("CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY, title TEXT NOT NULL, goal TEXT NOT NULL); CREATE TABLE IF NOT EXISTS records(id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL, actor TEXT NOT NULL, status TEXT NOT NULL, is_stale INTEGER NOT NULL DEFAULT 0, is_conflict INTEGER NOT NULL DEFAULT 0, conflicts_with INTEGER, sensitive_release_state TEXT NOT NULL DEFAULT 'not_required'); CREATE TABLE IF NOT EXISTS revoked_sessions(actor TEXT PRIMARY KEY);")?; self.add_record_column_if_missing("is_conflict", "INTEGER NOT NULL DEFAULT 0")?; self.add_record_column_if_missing("conflicts_with", "INTEGER")?; self.add_record_column_if_missing("sensitive_release_state", "TEXT NOT NULL DEFAULT 'not_required'")?; self.storage.connection().execute("UPDATE records SET sensitive_release_state='not_required' WHERE sensitive_release_state IS NULL", [])?; Ok(()) }
- fn add_record_column_if_missing(&self, name: &str, definition: &str) -> rusqlite::Result<()> { let mut statement = self.storage.connection().prepare("PRAGMA table_info(records)")?; let existing = statement.query_map([], |row| row.get::<_, String>(1))?.collect::<rusqlite::Result<Vec<_>>>()?; if !existing.iter().any(|column| column == name) { self.storage.connection().execute(&format!("ALTER TABLE records ADD COLUMN {name} {definition}"), [])?; } Ok(()) }
- pub fn create_task(&mut self, title: &str, goal: &str) -> rusqlite::Result<Task> { self.storage.connection().execute("INSERT INTO tasks(title, goal) VALUES (?1, ?2)", params![title, goal])?; Ok(Task { id: self.storage.connection().last_insert_rowid() }) }
- pub fn propose(&mut self, task_id: i64, kind: RecordType, content: &str, actor: &str) -> rusqlite::Result<Record> { self.propose_with_current_version(task_id, kind, content, actor) }
- pub fn propose_from_version(&mut self, task_id: i64, kind: RecordType, content: &str, actor: &str, base_version: i64) -> rusqlite::Result<Record> { self.propose_from_version_impl(task_id, kind, content, actor, base_version) }
- fn propose_with_current_version(&self, task_id: i64, kind: RecordType, content: &str, actor: &str) -> rusqlite::Result<Record> { self.ensure_session_active(actor)?; self.propose_from_version_impl(task_id, kind, content, actor, self.confirmed_version(task_id)?) }
- fn propose_from_version_impl(&self, task_id: i64, kind: RecordType, content: &str, actor: &str, base_version: i64) -> rusqlite::Result<Record> { self.ensure_session_active(actor)?; let is_stale = base_version < self.confirmed_version(task_id)?; let conflict = self.possible_conflict(task_id, kind, content)?; let is_conflict = conflict.is_some(); let sensitive_release_state = Self::sensitive_release_state(content); self.storage.connection().execute("INSERT INTO records(task_id, kind, content, actor, status, is_stale, is_conflict, conflicts_with, sensitive_release_state) VALUES (?1, ?2, ?3, ?4, 'proposed', ?5, ?6, ?7, ?8)", params![task_id, kind.as_str(), content, actor, is_stale, is_conflict, conflict, sensitive_release_state.as_str()])?; Ok(Record { id: self.storage.connection().last_insert_rowid(), content: content.into(), is_stale, is_conflict, conflicts_with: conflict, sensitive_release_state }) }
- pub fn revoke_session(&self, actor: &str) -> rusqlite::Result<()> { self.storage.connection().execute("INSERT OR IGNORE INTO revoked_sessions(actor) VALUES (?1)", params![actor])?; Ok(()) }
- fn ensure_session_active(&self, actor: &str) -> rusqlite::Result<()> { let revoked: bool = self.storage.connection().query_row("SELECT EXISTS(SELECT 1 FROM revoked_sessions WHERE actor=?1)", params![actor], |row| row.get(0))?; if revoked { Err(rusqlite::Error::InvalidQuery) } else { Ok(()) } }
- fn sensitive_release_state(content: &str) -> SensitiveReleaseState { let normalized = content.to_ascii_lowercase(); if ["api key", "password", "secret", "access token"].iter().any(|marker| normalized.contains(marker)) { SensitiveReleaseState::Pending } else { SensitiveReleaseState::NotRequired } }
- fn confirmed_version(&self, task_id: i64) -> rusqlite::Result<i64> { self.storage.connection().query_row("SELECT 1 + COUNT(*) FROM records WHERE task_id=?1 AND status='confirmed'", params![task_id], |row| row.get(0)) }
- fn possible_conflict(&self, task_id: i64, kind: RecordType, content: &str) -> rusqlite::Result<Option<i64>> { if !matches!(kind, RecordType::Goal | RecordType::Decision | RecordType::Change) { return Ok(None); } self.storage.connection().query_row("SELECT id, content FROM records WHERE task_id=?1 AND kind=?2 AND status='confirmed' ORDER BY id DESC LIMIT 1", params![task_id, kind.as_str()], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))).optional().map(|record| record.and_then(|(id, confirmed)| (confirmed != content).then_some(id))) }
- pub fn review(&self, id: i64, outcome: ProposalOutcome) -> rusqlite::Result<()> { let status = match outcome { ProposalOutcome::Accept => "confirmed", ProposalOutcome::Reject => "rejected" }; self.storage.connection().execute("UPDATE records SET status=?1 WHERE id=?2 AND status='proposed'", params![status, id])?; Ok(()) }
- pub fn edit_and_accept(&self, id: i64, content: &str) -> rusqlite::Result<()> { let sensitive_release_state = Self::sensitive_release_state(content); self.storage.connection().execute("UPDATE records SET content=?1, status='confirmed', sensitive_release_state=?2 WHERE id=?3 AND status='proposed'", params![content, sensitive_release_state.as_str(), id])?; Ok(()) }
- pub fn approve_sensitive_release(&self, id: i64) -> rusqlite::Result<()> { self.storage.connection().execute("UPDATE records SET sensitive_release_state='approved' WHERE id=?1 AND status='confirmed' AND sensitive_release_state='pending'", params![id])?; Ok(()) }
- pub fn compose_handoff(&self, task_id: i64, schema_version: &str, actor: &str) -> rusqlite::Result<Handoff> { self.ensure_session_active(actor)?; let goal = self.storage.connection().query_row("SELECT goal FROM tasks WHERE id=?1", params![task_id], |row| row.get(0))?; let mut decisions = Vec::new(); let mut open_questions = Vec::new(); let mut next_steps = Vec::new(); let mut statement = self.storage.connection().prepare("SELECT kind, content, sensitive_release_state FROM records WHERE task_id=?1 AND status='confirmed' ORDER BY id")?; let rows = statement.query_map(params![task_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, SensitiveReleaseState::from_str(row.get(2)?))))?; for row in rows { let (kind, content, state) = row?; if state == SensitiveReleaseState::Pending { continue; } match kind.as_str() { "decision" => decisions.push(content), "open_question" => open_questions.push(content), "change" => next_steps.push(content), _ => {} } } Ok(Handoff { schema_version: schema_version.into(), goal, decisions, open_questions, next_steps }) }
- pub fn resume(&self, task_id: i64) -> rusqlite::Result<Snapshot> { let goal = self.storage.connection().query_row("SELECT goal FROM tasks WHERE id=?1", params![task_id], |r| r.get(0))?; let load = |status| -> rusqlite::Result<Vec<Record>> { let mut s = self.storage.connection().prepare("SELECT id, content, is_stale, is_conflict, conflicts_with, sensitive_release_state FROM records WHERE task_id=?1 AND status=?2 ORDER BY id")?; let rows = s.query_map(params![task_id, status], |r| Ok(Record { id: r.get(0)?, content: r.get(1)?, is_stale: r.get(2)?, is_conflict: r.get(3)?, conflicts_with: r.get(4)?, sensitive_release_state: SensitiveReleaseState::from_str(r.get(5)?) }))?; let records: rusqlite::Result<Vec<Record>> = rows.collect(); records }; Ok(Snapshot { goal, confirmed: load("confirmed")?, rejected: load("rejected")? }) }
- pub fn what_just_happened(&self, task_id: i64, schema_version: &str, actor: &str) -> rusqlite::Result<Heartbeat> { self.ensure_session_active(actor)?; let snapshot = self.resume(task_id)?; Ok(Heartbeat { schema_version: schema_version.into(), goal: snapshot.goal, recent_changes: snapshot.confirmed.into_iter().filter(|record| record.sensitive_release_state != SensitiveReleaseState::Pending).map(|record| record.content).collect() }) }
- pub fn pending(&self, task_id: i64) -> rusqlite::Result<Vec<Record>> { let mut statement = self.storage.connection().prepare("SELECT id, content, is_stale, is_conflict, conflicts_with, sensitive_release_state FROM records WHERE task_id=?1 AND status='proposed' ORDER BY id")?; let rows = statement.query_map(params![task_id], |row| Ok(Record { id: row.get(0)?, content: row.get(1)?, is_stale: row.get(2)?, is_conflict: row.get(3)?, conflicts_with: row.get(4)?, sensitive_release_state: SensitiveReleaseState::from_str(row.get(5)?) }))?; rows.collect() }
+pub enum RecordType {
+    Goal,
+    Decision,
+    Change,
+    OpenQuestion,
+    Handoff,
 }
-impl BoardView { pub fn load(api: &TaskAccessApi<'_>, task_id: i64) -> rusqlite::Result<Self> { let heartbeat = api.what_just_happened(task_id, "v1", "board")?; Ok(Self { goal: heartbeat.goal, pending: api.pending(task_id)? }) } pub fn accept(&self, api: &TaskAccessApi<'_>, proposal_id: i64) -> rusqlite::Result<()> { api.accept(proposal_id) } }
+impl RecordType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Goal => "goal",
+            Self::Decision => "decision",
+            Self::Change => "change",
+            Self::OpenQuestion => "open_question",
+            Self::Handoff => "handoff",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum ProposalOutcome {
+    Accept,
+    Reject,
+}
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SensitiveReleaseState {
+    NotRequired,
+    Pending,
+    Approved,
+}
+impl SensitiveReleaseState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequired => "not_required",
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+        }
+    }
+    fn from_str(value: String) -> Self {
+        match value.as_str() {
+            "not_required" => Self::NotRequired,
+            "approved" => Self::Approved,
+            _ => Self::Pending,
+        }
+    }
+}
+pub struct Task {
+    pub id: i64,
+}
+pub struct Record {
+    pub id: i64,
+    pub content: String,
+    pub is_stale: bool,
+    pub is_conflict: bool,
+    pub conflicts_with: Option<i64>,
+    pub sensitive_release_state: SensitiveReleaseState,
+}
+pub struct Snapshot {
+    pub goal: String,
+    pub confirmed: Vec<Record>,
+    pub rejected: Vec<Record>,
+}
+pub struct Heartbeat {
+    pub schema_version: String,
+    pub goal: String,
+    pub recent_changes: Vec<String>,
+}
+pub struct Handoff {
+    pub schema_version: String,
+    pub goal: String,
+    pub decisions: Vec<String>,
+    pub open_questions: Vec<String>,
+    pub next_steps: Vec<String>,
+}
+pub struct BoardView {
+    pub goal: String,
+    pub pending: Vec<Record>,
+}
+
+pub trait Storage {
+    fn connection(&self) -> &Connection;
+}
+pub struct SqliteStorage {
+    connection: Connection,
+}
+impl Storage for SqliteStorage {
+    fn connection(&self) -> &Connection {
+        &self.connection
+    }
+}
+
+pub struct Board {
+    storage: SqliteStorage,
+}
+pub struct TaskAccessApi<'a> {
+    engine: &'a Board,
+}
+pub trait TaskTransport {
+    fn request_heartbeat(
+        &self,
+        api: &TaskAccessApi<'_>,
+        task_id: i64,
+        schema_version: &str,
+        actor: &str,
+    ) -> rusqlite::Result<Heartbeat>;
+}
+pub struct LoopbackRelay;
+impl LoopbackRelay {
+    pub fn request_heartbeat(
+        &self,
+        api: &TaskAccessApi<'_>,
+        task_id: i64,
+        schema_version: &str,
+        actor: &str,
+    ) -> rusqlite::Result<Heartbeat> {
+        api.what_just_happened(task_id, schema_version, actor)
+    }
+}
+impl<'a> TaskAccessApi<'a> {
+    pub fn new(engine: &'a Board) -> Self {
+        Self { engine }
+    }
+    pub fn what_just_happened(
+        &self,
+        task_id: i64,
+        schema_version: &str,
+        actor: &str,
+    ) -> rusqlite::Result<Heartbeat> {
+        self.engine
+            .what_just_happened(task_id, schema_version, actor)
+    }
+    pub fn compose_handoff(
+        &self,
+        task_id: i64,
+        schema_version: &str,
+        actor: &str,
+    ) -> rusqlite::Result<Handoff> {
+        self.engine.compose_handoff(task_id, schema_version, actor)
+    }
+    pub fn subscribe(&self, actor: &str) -> rusqlite::Result<()> {
+        self.engine.ensure_session_active(actor)
+    }
+    pub fn revoke_session(&self, actor: &str) -> rusqlite::Result<()> {
+        self.engine.revoke_session(actor)
+    }
+    pub fn propose(
+        &self,
+        task_id: i64,
+        kind: RecordType,
+        content: &str,
+        actor: &str,
+    ) -> rusqlite::Result<Record> {
+        self.engine
+            .propose_with_current_version(task_id, kind, content, actor)
+    }
+    pub fn propose_from_version(
+        &self,
+        task_id: i64,
+        kind: RecordType,
+        content: &str,
+        actor: &str,
+        base_version: i64,
+    ) -> rusqlite::Result<Record> {
+        self.engine
+            .propose_from_version_impl(task_id, kind, content, actor, base_version)
+    }
+    pub fn pending(&self, task_id: i64) -> rusqlite::Result<Vec<Record>> {
+        self.engine.pending(task_id)
+    }
+    pub fn accept(&self, id: i64) -> rusqlite::Result<()> {
+        self.engine.review(id, ProposalOutcome::Accept)
+    }
+    pub fn reject(&self, id: i64) -> rusqlite::Result<()> {
+        self.engine.review(id, ProposalOutcome::Reject)
+    }
+    pub fn edit_and_accept(&self, id: i64, content: &str) -> rusqlite::Result<()> {
+        self.engine.edit_and_accept(id, content)
+    }
+    pub fn approve_sensitive_release(&self, id: i64) -> rusqlite::Result<()> {
+        self.engine.approve_sensitive_release(id)
+    }
+}
+impl TaskTransport for LoopbackRelay {
+    fn request_heartbeat(
+        &self,
+        api: &TaskAccessApi<'_>,
+        task_id: i64,
+        schema_version: &str,
+        actor: &str,
+    ) -> rusqlite::Result<Heartbeat> {
+        api.what_just_happened(task_id, schema_version, actor)
+    }
+}
+impl Board {
+    pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
+        let storage = SqliteStorage {
+            connection: Connection::open(path)?,
+        };
+        let board = Self { storage };
+        board.migrate()?;
+        Ok(board)
+    }
+    fn migrate(&self) -> rusqlite::Result<()> {
+        self.storage.connection().execute_batch("CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY, title TEXT NOT NULL, goal TEXT NOT NULL); CREATE TABLE IF NOT EXISTS records(id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL, actor TEXT NOT NULL, status TEXT NOT NULL, is_stale INTEGER NOT NULL DEFAULT 0, is_conflict INTEGER NOT NULL DEFAULT 0, conflicts_with INTEGER, sensitive_release_state TEXT NOT NULL DEFAULT 'not_required'); CREATE TABLE IF NOT EXISTS revoked_sessions(actor TEXT PRIMARY KEY);")?;
+        self.add_record_column_if_missing("is_conflict", "INTEGER NOT NULL DEFAULT 0")?;
+        self.add_record_column_if_missing("conflicts_with", "INTEGER")?;
+        self.add_record_column_if_missing(
+            "sensitive_release_state",
+            "TEXT NOT NULL DEFAULT 'not_required'",
+        )?;
+        self.storage.connection().execute("UPDATE records SET sensitive_release_state='not_required' WHERE sensitive_release_state IS NULL", [])?;
+        Ok(())
+    }
+    fn add_record_column_if_missing(&self, name: &str, definition: &str) -> rusqlite::Result<()> {
+        let mut statement = self
+            .storage
+            .connection()
+            .prepare("PRAGMA table_info(records)")?;
+        let existing = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if !existing.iter().any(|column| column == name) {
+            self.storage.connection().execute(
+                &format!("ALTER TABLE records ADD COLUMN {name} {definition}"),
+                [],
+            )?;
+        }
+        Ok(())
+    }
+    pub fn create_task(&mut self, title: &str, goal: &str) -> rusqlite::Result<Task> {
+        self.storage.connection().execute(
+            "INSERT INTO tasks(title, goal) VALUES (?1, ?2)",
+            params![title, goal],
+        )?;
+        Ok(Task {
+            id: self.storage.connection().last_insert_rowid(),
+        })
+    }
+    pub fn propose(
+        &mut self,
+        task_id: i64,
+        kind: RecordType,
+        content: &str,
+        actor: &str,
+    ) -> rusqlite::Result<Record> {
+        self.propose_with_current_version(task_id, kind, content, actor)
+    }
+    pub fn propose_from_version(
+        &mut self,
+        task_id: i64,
+        kind: RecordType,
+        content: &str,
+        actor: &str,
+        base_version: i64,
+    ) -> rusqlite::Result<Record> {
+        self.propose_from_version_impl(task_id, kind, content, actor, base_version)
+    }
+    fn propose_with_current_version(
+        &self,
+        task_id: i64,
+        kind: RecordType,
+        content: &str,
+        actor: &str,
+    ) -> rusqlite::Result<Record> {
+        self.ensure_session_active(actor)?;
+        self.propose_from_version_impl(
+            task_id,
+            kind,
+            content,
+            actor,
+            self.confirmed_version(task_id)?,
+        )
+    }
+    fn propose_from_version_impl(
+        &self,
+        task_id: i64,
+        kind: RecordType,
+        content: &str,
+        actor: &str,
+        base_version: i64,
+    ) -> rusqlite::Result<Record> {
+        self.ensure_session_active(actor)?;
+        let is_stale = base_version < self.confirmed_version(task_id)?;
+        let conflict = self.possible_conflict(task_id, kind, content)?;
+        let is_conflict = conflict.is_some();
+        let sensitive_release_state = Self::sensitive_release_state(content);
+        self.storage.connection().execute("INSERT INTO records(task_id, kind, content, actor, status, is_stale, is_conflict, conflicts_with, sensitive_release_state) VALUES (?1, ?2, ?3, ?4, 'proposed', ?5, ?6, ?7, ?8)", params![task_id, kind.as_str(), content, actor, is_stale, is_conflict, conflict, sensitive_release_state.as_str()])?;
+        Ok(Record {
+            id: self.storage.connection().last_insert_rowid(),
+            content: content.into(),
+            is_stale,
+            is_conflict,
+            conflicts_with: conflict,
+            sensitive_release_state,
+        })
+    }
+    pub fn revoke_session(&self, actor: &str) -> rusqlite::Result<()> {
+        self.storage.connection().execute(
+            "INSERT OR IGNORE INTO revoked_sessions(actor) VALUES (?1)",
+            params![actor],
+        )?;
+        Ok(())
+    }
+    fn ensure_session_active(&self, actor: &str) -> rusqlite::Result<()> {
+        let revoked: bool = self.storage.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM revoked_sessions WHERE actor=?1)",
+            params![actor],
+            |row| row.get(0),
+        )?;
+        if revoked {
+            Err(rusqlite::Error::InvalidQuery)
+        } else {
+            Ok(())
+        }
+    }
+    fn sensitive_release_state(content: &str) -> SensitiveReleaseState {
+        let normalized = content.to_ascii_lowercase();
+        if ["api key", "password", "secret", "access token"]
+            .iter()
+            .any(|marker| normalized.contains(marker))
+        {
+            SensitiveReleaseState::Pending
+        } else {
+            SensitiveReleaseState::NotRequired
+        }
+    }
+    fn confirmed_version(&self, task_id: i64) -> rusqlite::Result<i64> {
+        self.storage.connection().query_row(
+            "SELECT 1 + COUNT(*) FROM records WHERE task_id=?1 AND status='confirmed'",
+            params![task_id],
+            |row| row.get(0),
+        )
+    }
+    fn possible_conflict(
+        &self,
+        task_id: i64,
+        kind: RecordType,
+        content: &str,
+    ) -> rusqlite::Result<Option<i64>> {
+        if !matches!(
+            kind,
+            RecordType::Goal | RecordType::Decision | RecordType::Change
+        ) {
+            return Ok(None);
+        }
+        self.storage.connection().query_row("SELECT id, content FROM records WHERE task_id=?1 AND kind=?2 AND status='confirmed' ORDER BY id DESC LIMIT 1", params![task_id, kind.as_str()], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))).optional().map(|record| record.and_then(|(id, confirmed)| (confirmed != content).then_some(id)))
+    }
+    pub fn review(&self, id: i64, outcome: ProposalOutcome) -> rusqlite::Result<()> {
+        let status = match outcome {
+            ProposalOutcome::Accept => "confirmed",
+            ProposalOutcome::Reject => "rejected",
+        };
+        self.storage.connection().execute(
+            "UPDATE records SET status=?1 WHERE id=?2 AND status='proposed'",
+            params![status, id],
+        )?;
+        Ok(())
+    }
+    pub fn edit_and_accept(&self, id: i64, content: &str) -> rusqlite::Result<()> {
+        let sensitive_release_state = Self::sensitive_release_state(content);
+        self.storage.connection().execute("UPDATE records SET content=?1, status='confirmed', sensitive_release_state=?2 WHERE id=?3 AND status='proposed'", params![content, sensitive_release_state.as_str(), id])?;
+        Ok(())
+    }
+    pub fn approve_sensitive_release(&self, id: i64) -> rusqlite::Result<()> {
+        self.storage.connection().execute("UPDATE records SET sensitive_release_state='approved' WHERE id=?1 AND status='confirmed' AND sensitive_release_state='pending'", params![id])?;
+        Ok(())
+    }
+    pub fn compose_handoff(
+        &self,
+        task_id: i64,
+        schema_version: &str,
+        actor: &str,
+    ) -> rusqlite::Result<Handoff> {
+        self.ensure_session_active(actor)?;
+        let goal = self.storage.connection().query_row(
+            "SELECT goal FROM tasks WHERE id=?1",
+            params![task_id],
+            |row| row.get(0),
+        )?;
+        let mut decisions = Vec::new();
+        let mut open_questions = Vec::new();
+        let mut next_steps = Vec::new();
+        let mut statement = self.storage.connection().prepare("SELECT kind, content, sensitive_release_state FROM records WHERE task_id=?1 AND status='confirmed' ORDER BY id")?;
+        let rows = statement.query_map(params![task_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                SensitiveReleaseState::from_str(row.get(2)?),
+            ))
+        })?;
+        for row in rows {
+            let (kind, content, state) = row?;
+            if state == SensitiveReleaseState::Pending {
+                continue;
+            }
+            match kind.as_str() {
+                "decision" => decisions.push(content),
+                "open_question" => open_questions.push(content),
+                "change" => next_steps.push(content),
+                _ => {}
+            }
+        }
+        Ok(Handoff {
+            schema_version: schema_version.into(),
+            goal,
+            decisions,
+            open_questions,
+            next_steps,
+        })
+    }
+    pub fn resume(&self, task_id: i64) -> rusqlite::Result<Snapshot> {
+        let goal = self.storage.connection().query_row(
+            "SELECT goal FROM tasks WHERE id=?1",
+            params![task_id],
+            |r| r.get(0),
+        )?;
+        let load = |status| -> rusqlite::Result<Vec<Record>> {
+            let mut s = self.storage.connection().prepare("SELECT id, content, is_stale, is_conflict, conflicts_with, sensitive_release_state FROM records WHERE task_id=?1 AND status=?2 ORDER BY id")?;
+            let rows = s.query_map(params![task_id, status], |r| {
+                Ok(Record {
+                    id: r.get(0)?,
+                    content: r.get(1)?,
+                    is_stale: r.get(2)?,
+                    is_conflict: r.get(3)?,
+                    conflicts_with: r.get(4)?,
+                    sensitive_release_state: SensitiveReleaseState::from_str(r.get(5)?),
+                })
+            })?;
+            let records: rusqlite::Result<Vec<Record>> = rows.collect();
+            records
+        };
+        Ok(Snapshot {
+            goal,
+            confirmed: load("confirmed")?,
+            rejected: load("rejected")?,
+        })
+    }
+    pub fn what_just_happened(
+        &self,
+        task_id: i64,
+        schema_version: &str,
+        actor: &str,
+    ) -> rusqlite::Result<Heartbeat> {
+        self.ensure_session_active(actor)?;
+        let snapshot = self.resume(task_id)?;
+        Ok(Heartbeat {
+            schema_version: schema_version.into(),
+            goal: snapshot.goal,
+            recent_changes: snapshot
+                .confirmed
+                .into_iter()
+                .filter(|record| record.sensitive_release_state != SensitiveReleaseState::Pending)
+                .map(|record| record.content)
+                .collect(),
+        })
+    }
+    pub fn pending(&self, task_id: i64) -> rusqlite::Result<Vec<Record>> {
+        let mut statement = self.storage.connection().prepare("SELECT id, content, is_stale, is_conflict, conflicts_with, sensitive_release_state FROM records WHERE task_id=?1 AND status='proposed' ORDER BY id")?;
+        let rows = statement.query_map(params![task_id], |row| {
+            Ok(Record {
+                id: row.get(0)?,
+                content: row.get(1)?,
+                is_stale: row.get(2)?,
+                is_conflict: row.get(3)?,
+                conflicts_with: row.get(4)?,
+                sensitive_release_state: SensitiveReleaseState::from_str(row.get(5)?),
+            })
+        })?;
+        rows.collect()
+    }
+}
+impl BoardView {
+    pub fn load(api: &TaskAccessApi<'_>, task_id: i64) -> rusqlite::Result<Self> {
+        let heartbeat = api.what_just_happened(task_id, "v1", "board")?;
+        Ok(Self {
+            goal: heartbeat.goal,
+            pending: api.pending(task_id)?,
+        })
+    }
+    pub fn accept(&self, api: &TaskAccessApi<'_>, proposal_id: i64) -> rusqlite::Result<()> {
+        api.accept(proposal_id)
+    }
+}
