@@ -42,6 +42,9 @@ def record_turn() -> bytes | None:
                         callback=lambda data, *_: chunks.append(data.copy())):
         input()
 
+    if not chunks:
+        return b""   # caller skips empty turns
+
     audio = np.concatenate(chunks, axis=0)
 
     buf = io.BytesIO()
