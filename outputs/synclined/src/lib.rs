@@ -53,6 +53,8 @@ pub struct Task {
 }
 pub struct Record {
     pub id: i64,
+    pub actor: String,
+    pub kind: String,
     pub content: String,
     pub is_stale: bool,
     pub is_conflict: bool,
@@ -291,6 +293,8 @@ impl Board {
         self.storage.connection().execute("INSERT INTO records(task_id, kind, content, actor, status, is_stale, is_conflict, conflicts_with, sensitive_release_state) VALUES (?1, ?2, ?3, ?4, 'proposed', ?5, ?6, ?7, ?8)", params![task_id, kind.as_str(), content, actor, is_stale, is_conflict, conflict, sensitive_release_state.as_str()])?;
         Ok(Record {
             id: self.storage.connection().last_insert_rowid(),
+            actor: actor.into(),
+            kind: kind.as_str().into(),
             content: content.into(),
             is_stale,
             is_conflict,
@@ -419,10 +423,12 @@ impl Board {
             |r| r.get(0),
         )?;
         let load = |status| -> rusqlite::Result<Vec<Record>> {
-            let mut s = self.storage.connection().prepare("SELECT id, content, is_stale, is_conflict, conflicts_with, sensitive_release_state FROM records WHERE task_id=?1 AND status=?2 ORDER BY id")?;
+            let mut s = self.storage.connection().prepare("SELECT id, content, is_stale, is_conflict, conflicts_with, sensitive_release_state, actor, kind FROM records WHERE task_id=?1 AND status=?2 ORDER BY id")?;
             let rows = s.query_map(params![task_id, status], |r| {
                 Ok(Record {
                     id: r.get(0)?,
+                    actor: r.get(6)?,
+                    kind: r.get(7)?,
                     content: r.get(1)?,
                     is_stale: r.get(2)?,
                     is_conflict: r.get(3)?,
@@ -459,10 +465,12 @@ impl Board {
         })
     }
     pub fn pending(&self, task_id: i64) -> rusqlite::Result<Vec<Record>> {
-        let mut statement = self.storage.connection().prepare("SELECT id, content, is_stale, is_conflict, conflicts_with, sensitive_release_state FROM records WHERE task_id=?1 AND status='proposed' ORDER BY id")?;
+        let mut statement = self.storage.connection().prepare("SELECT id, content, is_stale, is_conflict, conflicts_with, sensitive_release_state, actor, kind FROM records WHERE task_id=?1 AND status='proposed' ORDER BY id")?;
         let rows = statement.query_map(params![task_id], |row| {
             Ok(Record {
                 id: row.get(0)?,
+                actor: row.get(6)?,
+                kind: row.get(7)?,
                 content: row.get(1)?,
                 is_stale: row.get(2)?,
                 is_conflict: row.get(3)?,

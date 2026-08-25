@@ -11,7 +11,7 @@ use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
-use synclined_core::{Board, RecordType, TaskAccessApi};
+use synclined_core::{Board, RecordType, SensitiveReleaseState, TaskAccessApi};
 
 struct AppState {
     board: Mutex<Board>,
@@ -30,6 +30,15 @@ fn kind_from_str(s: &str) -> Option<RecordType> {
     }
 }
 
+fn sensitivity_str(s: &SensitiveReleaseState) -> &'static str {
+    match s {
+        SensitiveReleaseState::NotRequired => "not_required",
+        SensitiveReleaseState::Pending => "pending",
+        SensitiveReleaseState::Approved => "approved",
+    }
+}
+
+// GET /context?actor=<name>
 async fn get_context(
     State(state): State<SharedState>,
     Query(params): Query<HashMap<String, String>>,
@@ -49,6 +58,7 @@ async fn get_context(
     }
 }
 
+// GET /pending
 async fn get_pending(State(state): State<SharedState>) -> impl IntoResponse {
     let board = state.board.lock().unwrap();
     let api = TaskAccessApi::new(&*board);
@@ -56,10 +66,40 @@ async fn get_pending(State(state): State<SharedState>) -> impl IntoResponse {
         Ok(records) => {
             let items: Vec<_> = records
                 .iter()
-                .map(|r| json!({ "id": r.id, "content": r.content, "is_stale": r.is_stale, "is_conflict": r.is_conflict }))
+                .map(|r| json!({
+                    "id": r.id,
+                    "actor": r.actor,
+                    "kind": r.kind,
+                    "content": r.content,
+                    "is_stale": r.is_stale,
+                    "is_conflict": r.is_conflict,
+                    "sensitive": sensitivity_str(&r.sensitive_release_state),
+                }))
                 .collect();
             Json(json!({ "task_id": state.task_id, "pending": items })).into_response()
         }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+// GET /handoff?actor=<name>
+async fn get_handoff(
+    State(state): State<SharedState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let actor = params.get("actor").cloned().unwrap_or_else(|| "anonymous".into());
+    let board = state.board.lock().unwrap();
+    let api = TaskAccessApi::new(&*board);
+    match api.compose_handoff(state.task_id, "v1", &actor) {
+        Ok(h) => Json(json!({
+            "task_id": state.task_id,
+            "schema": h.schema_version,
+            "goal": h.goal,
+            "decisions": h.decisions,
+            "open_questions": h.open_questions,
+            "next_steps": h.next_steps,
+        }))
+        .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -71,6 +111,7 @@ struct ProposeBody {
     actor: String,
 }
 
+// POST /propose
 async fn post_propose(
     State(state): State<SharedState>,
     Json(body): Json<ProposeBody>,
@@ -81,12 +122,17 @@ async fn post_propose(
     let board = state.board.lock().unwrap();
     let api = TaskAccessApi::new(&*board);
     match api.propose(state.task_id, kind, &body.content, &body.actor) {
-        Ok(r) => Json(json!({ "id": r.id, "is_stale": r.is_stale, "is_conflict": r.is_conflict }))
-            .into_response(),
+        Ok(r) => Json(json!({
+            "id": r.id,
+            "is_stale": r.is_stale,
+            "is_conflict": r.is_conflict,
+        }))
+        .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
+// POST /accept/:id
 async fn post_accept(
     State(state): State<SharedState>,
     Path(id): Path<i64>,
@@ -94,6 +140,19 @@ async fn post_accept(
     let board = state.board.lock().unwrap();
     let api = TaskAccessApi::new(&*board);
     match api.accept(id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+// POST /reject/:id
+async fn post_reject(
+    State(state): State<SharedState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let board = state.board.lock().unwrap();
+    let api = TaskAccessApi::new(&*board);
+    match api.reject(id) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -112,9 +171,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/context", get(get_context))
-        .route("/propose", post(post_propose))
         .route("/pending", get(get_pending))
+        .route("/handoff", get(get_handoff))
+        .route("/propose", post(post_propose))
         .route("/accept/:id", post(post_accept))
+        .route("/reject/:id", post(post_reject))
         .with_state(state);
 
     println!("synclined listening on http://localhost:3000");
