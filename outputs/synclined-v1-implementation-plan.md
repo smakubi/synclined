@@ -2,7 +2,7 @@
 
 **Goal:** Build a local, single-device task board where agents propose typed task-state updates and a developer explicitly confirms shared truth.
 
-**Architectural backbone:** The **Task State Engine**. It owns typed records, board versioning, proposal review, conflict/staleness detection, permissions, revocation, and the append-only local history. The board and agent adapters are replaceable clients of this engine; no client may bypass it.
+**Architectural backbone:** The **Task State Engine** and its **versioned Task Access API**. The engine owns task truth; the API is the public, permission-scoped contract through which every client reads or proposes state. No board, agent, or voice client may bypass it.
 
 **Stack:** Tauri 2 desktop shell, React + TypeScript board, Rust local core, SQLite persistence, and a local IPC interface.
 
@@ -37,15 +37,20 @@ Every milestone must be demoable. It ends with a checkpoint: review what was lea
 8. Document the engine API, persisted record shape, and demo steps.
 9. Hold an architecture checkpoint before adding the desktop board or agent IPC.
 
-### Milestone 2 — Persistent board and review loop
+### Milestone 2 — “What just happened?” access contract
 
-**Milestone:** A tested local engine can create tasks, record typed proposals, and confirm developer-approved state.
+**Milestone:** An authorized client can retrieve a compact, versioned, approved task-state summary from the local engine.
 
-1. Define `Task`, `TaskRecord`, `RecordType`, `RecordStatus`, `ActorSession`, and `BoardVersion` models.
-2. Add SQLite migrations and repository operations for append-only records.
-3. Implement `createTask`, `proposeRecord`, `acceptRecord`, `editAndAcceptRecord`, and `rejectRecord`.
-4. Write tests first for each state transition; verify rejected records never become confirmed.
-5. Publish a read-only board snapshot API.
+1. Define a versioned Task Access API schema, including contract version, task identity, actor session, scopes, and error shape.
+2. Expose only engine-backed read and proposal operations through the API.
+3. Add a `whatJustHappened` read operation returning the current goal, newly confirmed decisions and changes, open questions, and next step.
+4. Enforce the same permission scope at the API boundary that the engine enforces internally.
+5. Write contract tests for schema versioning, denied reads, and the compact summary.
+6. Define a transport interface independent of the API contract.
+7. Implement a minimal encrypted relay transport that forwards approved API messages only; it stores no task state and has no authority.
+8. Demonstrate one phone-side client receiving the summary through the relay after an agent proposal is reviewed and confirmed.
+9. Document the public contract, transport boundary, and founding laptop-to-phone workflow.
+10. Hold an architecture checkpoint before adding the board UI.
 
 **Milestone:** The developer can see all state continuously and turn a proposal into confirmed shared truth.
 
@@ -58,7 +63,7 @@ Every milestone must be demoable. It ends with a checkpoint: review what was lea
 7. Document board-state semantics and review controls.
 8. Hold an architecture checkpoint before adding agent access.
 
-### Milestone 3 — Agent sessions and permissions
+### Milestone 3 — Persistent board and review loop
 
 **Milestone:** A local agent can receive only authorized confirmed slices and submit only authorized typed proposals.
 
@@ -71,7 +76,7 @@ Every milestone must be demoable. It ends with a checkpoint: review what was lea
 7. Demonstrate a scoped agent session and a denied operation.
 8. Document the local session and permission contract.
 
-### Milestone 4 — Safety controls
+### Milestone 4 — Agent sessions and permissions
 
 **Milestone:** Conflicts, stale proposals, sensitive releases, and revocation are visible and cannot be bypassed.
 
@@ -84,7 +89,7 @@ Every milestone must be demoable. It ends with a checkpoint: review what was lea
 7. Demonstrate each safety state on the board.
 8. Document the policy, stale-state, and revocation behavior.
 
-### Milestone 5 — Curated handoffs and release quality
+### Milestone 5 — Safety controls and curated handoffs
 
 **Milestone:** A developer can review and release a safe handoff snapshot with complete local test coverage of the V1 contract.
 
@@ -101,10 +106,10 @@ Every milestone must be demoable. It ends with a checkpoint: review what was lea
 At the end of every milestone, answer: **Did we learn something that changes the architecture?** If yes, update the plan and add or amend an ADR before continuing. If no, record the decision to continue unchanged.
 
 - **Checkpoint 1:** Does the persisted vertical slice prove the Task State Engine boundary is sufficient for an independent reader to resume a task?
-- **Checkpoint 2:** Does the persistent board require a different state-event boundary?
-- **Checkpoint 3:** Do agent permissions belong entirely in the engine, or does local IPC expose a missing capability boundary?
-- **Checkpoint 4:** Do conflict, stale-state, sensitivity, or revocation controls require a model change?
-- **Checkpoint 5:** Are curated handoffs sufficient without raw chat or free-form notes?
+- **Checkpoint 2:** Does the public versioned contract provide enough approved state for a phone-side client to answer “what just happened?”
+- **Checkpoint 3:** Does the persistent board remain a simple consumer of the Task Access API?
+- **Checkpoint 4:** Do agent permissions belong entirely in the engine, or does the API expose a missing capability boundary?
+- **Checkpoint 5:** Do conflict, stale-state, sensitivity, revocation, and curated handoffs require a model change?
 
 ## ADR set
 
@@ -114,3 +119,5 @@ At the end of every milestone, answer: **Did we learn something that changes the
 - [ADR-004: Local-first scope and session identity](adr/ADR-004-local-first-session-identity.md)
 - [ADR-005: Typed records, curated handoffs, and no raw chat](adr/ADR-005-typed-records-curated-handoffs.md)
 - [ADR-006: Append-only history, conflicts, staleness, and revocation](adr/ADR-006-history-conflicts-revocation.md)
+- [ADR-007: Versioned Task Access API](adr/ADR-007-versioned-task-access-api.md)
+- [ADR-008: Minimal encrypted relay transport](adr/ADR-008-minimal-encrypted-relay.md)
