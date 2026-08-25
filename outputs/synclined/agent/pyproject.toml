@@ -1,0 +1,10 @@
+[project]
+name = "synclined-agent"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.30.0",
+    "sounddevice>=0.4.6",
+    "numpy>=1.26.0",
+    "httpx>=0.27.0",
+]
