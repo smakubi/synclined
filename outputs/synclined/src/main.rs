@@ -13,6 +13,8 @@ use std::{
 };
 use synclined_core::{Board, RecordType, SensitiveReleaseState, TaskAccessApi};
 
+const BOARD_HTML: &str = include_str!("board.html");
+
 struct AppState {
     board: Mutex<Board>,
     task_id: i64,
@@ -35,6 +37,40 @@ fn sensitivity_str(s: &SensitiveReleaseState) -> &'static str {
         SensitiveReleaseState::NotRequired => "not_required",
         SensitiveReleaseState::Pending => "pending",
         SensitiveReleaseState::Approved => "approved",
+    }
+}
+
+// GET / — board UI
+async fn get_board() -> impl IntoResponse {
+    ([("content-type", "text/html; charset=utf-8")], BOARD_HTML)
+}
+
+// GET /snapshot — confirmed records with full provenance (actor, kind)
+async fn get_snapshot(State(state): State<SharedState>) -> impl IntoResponse {
+    let board = state.board.lock().unwrap();
+    match board.resume(state.task_id) {
+        Ok(snapshot) => {
+            let confirmed: Vec<_> = snapshot
+                .confirmed
+                .iter()
+                .filter(|r| r.sensitive_release_state != SensitiveReleaseState::Pending)
+                .map(|r| {
+                    json!({
+                        "id": r.id,
+                        "actor": r.actor,
+                        "kind": r.kind,
+                        "content": r.content,
+                    })
+                })
+                .collect();
+            Json(json!({
+                "task_id": state.task_id,
+                "goal": snapshot.goal,
+                "confirmed": confirmed,
+            }))
+            .into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -170,6 +206,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let app = Router::new()
+        .route("/", get(get_board))
+        .route("/snapshot", get(get_snapshot))
         .route("/context", get(get_context))
         .route("/pending", get(get_pending))
         .route("/handoff", get(get_handoff))
