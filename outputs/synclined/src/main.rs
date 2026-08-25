@@ -1,0 +1,124 @@
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
+use serde::Deserialize;
+use serde_json::json;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
+use synclined_core::{Board, RecordType, TaskAccessApi};
+
+struct AppState {
+    board: Mutex<Board>,
+    task_id: i64,
+}
+type SharedState = Arc<AppState>;
+
+fn kind_from_str(s: &str) -> Option<RecordType> {
+    match s {
+        "goal" => Some(RecordType::Goal),
+        "decision" => Some(RecordType::Decision),
+        "change" => Some(RecordType::Change),
+        "open_question" => Some(RecordType::OpenQuestion),
+        "handoff" => Some(RecordType::Handoff),
+        _ => None,
+    }
+}
+
+async fn get_context(
+    State(state): State<SharedState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let actor = params.get("actor").cloned().unwrap_or_else(|| "anonymous".into());
+    let board = state.board.lock().unwrap();
+    let api = TaskAccessApi::new(&*board);
+    match api.what_just_happened(state.task_id, "v1", &actor) {
+        Ok(h) => Json(json!({
+            "task_id": state.task_id,
+            "schema": h.schema_version,
+            "goal": h.goal,
+            "recent_changes": h.recent_changes,
+        }))
+        .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn get_pending(State(state): State<SharedState>) -> impl IntoResponse {
+    let board = state.board.lock().unwrap();
+    let api = TaskAccessApi::new(&*board);
+    match api.pending(state.task_id) {
+        Ok(records) => {
+            let items: Vec<_> = records
+                .iter()
+                .map(|r| json!({ "id": r.id, "content": r.content, "is_stale": r.is_stale, "is_conflict": r.is_conflict }))
+                .collect();
+            Json(json!({ "task_id": state.task_id, "pending": items })).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ProposeBody {
+    kind: String,
+    content: String,
+    actor: String,
+}
+
+async fn post_propose(
+    State(state): State<SharedState>,
+    Json(body): Json<ProposeBody>,
+) -> impl IntoResponse {
+    let Some(kind) = kind_from_str(&body.kind) else {
+        return (StatusCode::BAD_REQUEST, format!("unknown kind: {}", body.kind)).into_response();
+    };
+    let board = state.board.lock().unwrap();
+    let api = TaskAccessApi::new(&*board);
+    match api.propose(state.task_id, kind, &body.content, &body.actor) {
+        Ok(r) => Json(json!({ "id": r.id, "is_stale": r.is_stale, "is_conflict": r.is_conflict }))
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn post_accept(
+    State(state): State<SharedState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let board = state.board.lock().unwrap();
+    let api = TaskAccessApi::new(&*board);
+    match api.accept(id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut board = Board::open("synclined.db")?;
+    let task = board.create_task("Shared context", "Coordinate between voice agent and Claude Code")?;
+    println!("task_id: {}", task.id);
+
+    let state: SharedState = Arc::new(AppState {
+        board: Mutex::new(board),
+        task_id: task.id,
+    });
+
+    let app = Router::new()
+        .route("/context", get(get_context))
+        .route("/propose", post(post_propose))
+        .route("/pending", get(get_pending))
+        .route("/accept/:id", post(post_accept))
+        .with_state(state);
+
+    println!("synclined listening on http://localhost:3000");
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
