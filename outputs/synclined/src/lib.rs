@@ -16,6 +16,12 @@ pub struct SqliteStorage { connection: Connection }
 impl Storage for SqliteStorage { fn connection(&self) -> &Connection { &self.connection } }
 
 pub struct Board { storage: SqliteStorage }
+pub struct TaskAccessApi<'a> { engine: &'a Board }
+pub trait TaskTransport { fn request_heartbeat(&self, api: &TaskAccessApi<'_>, task_id: i64, schema_version: &str, actor: &str) -> rusqlite::Result<Heartbeat>; }
+pub struct LoopbackRelay;
+impl LoopbackRelay { pub fn request_heartbeat(&self, api: &TaskAccessApi<'_>, task_id: i64, schema_version: &str, actor: &str) -> rusqlite::Result<Heartbeat> { api.what_just_happened(task_id, schema_version, actor) } }
+impl<'a> TaskAccessApi<'a> { pub fn new(engine: &'a Board) -> Self { Self { engine } } pub fn what_just_happened(&self, task_id: i64, schema_version: &str, actor: &str) -> rusqlite::Result<Heartbeat> { self.engine.what_just_happened(task_id, schema_version, actor) } }
+impl TaskTransport for LoopbackRelay { fn request_heartbeat(&self, api: &TaskAccessApi<'_>, task_id: i64, schema_version: &str, actor: &str) -> rusqlite::Result<Heartbeat> { api.what_just_happened(task_id, schema_version, actor) } }
 impl Board {
  pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> { let storage = SqliteStorage { connection: Connection::open(path)? }; let board = Self { storage }; board.migrate()?; Ok(board) }
  fn migrate(&self) -> rusqlite::Result<()> { self.storage.connection().execute_batch("CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY, title TEXT NOT NULL, goal TEXT NOT NULL); CREATE TABLE IF NOT EXISTS records(id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL, actor TEXT NOT NULL, status TEXT NOT NULL);") }
